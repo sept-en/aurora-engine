@@ -1,7 +1,21 @@
+use crate::parameters::BridgedTokenWithdrawEthConnectorArgs;
 use crate::prelude::{Address, Borrowed, Vec, H160, H256, U256};
 use evm::{Context, ExitError, ExitSucceed};
 
+use alloc::string::{String, ToString};
+use borsh::BorshSerialize;
+
+use crate::parameters::{BridgedTokenWithdrawArgs, NEP41TransferCallArgs};
+use crate::sdk;
+use crate::types::{AccountId, Gas};
+
 type PrecompileResult = Result<(ExitSucceed, Vec<u8>, u64), ExitError>;
+
+// Computed as: near_account_to_evm_address("exitToEthereum".as_bytes()).to_low_u64_be()
+const EXIT_TO_ETHEREUM_ID: u64 = 17176159495920586411;
+
+// Computed as: near_account_to_evm_address("exitToNear".as_bytes()).to_low_u64_be()
+const EXIT_TO_NEAR_ID: u64 = 11421322804619973199;
 
 #[allow(dead_code)]
 pub fn no_precompiles(
@@ -18,7 +32,7 @@ pub fn istanbul_precompiles(
     address: Address,
     input: &[u8],
     _target_gas: Option<u64>,
-    _context: &Context,
+    context: &Context,
 ) -> Option<PrecompileResult> {
     match address.to_low_u64_be() {
         1 => Some(Ok((
@@ -42,9 +56,154 @@ pub fn istanbul_precompiles(
         7 => todo!(), // TODO: implement alt_bn128_mul()
         8 => todo!(), // TODO: implement alt_bn128_pair()
         9 => todo!(), // TODO: implement blake2f()
+        EXIT_TO_NEAR_ID => {
+            exit_to_near(&input, &context);
+            Some(Ok((ExitSucceed::Returned, Vec::new(), 0)))
+        }
+        EXIT_TO_ETHEREUM_ID => {
+            exit_to_ethereum(&input, &context);
+            Some(Ok((ExitSucceed::Returned, Vec::new(), 0)))
+        }
         // Not supported.
         _ => None,
     }
+}
+
+#[allow(dead_code)]
+fn exit_to_near(input: &[u8], context: &Context) {
+    // TODO: Determine the correct amount of gas
+    const GAS_FOR_FT_TRANSFER: Gas = 50_000;
+    // if Self::required_gas(input)? > target_gas {
+    //     return Err(ExitError::OutOfGas);
+    // }
+
+    let (nep141account, args) = if context.apparent_value != U256::from(0) {
+        // ETH transfer
+        //
+        // Input slice format:
+        //      recipient_account_id (bytes) - the NEAR recipient account which will receive NEP-141 ETH tokens
+
+        (
+            String::from_utf8(sdk::current_account_id()).unwrap(),
+            NEP41TransferCallArgs {
+                receiver_id: String::from_utf8(input.to_vec()).unwrap(),
+                amount: context.apparent_value.as_u128(),
+                memo: None,
+            },
+        )
+    } else {
+        // ERC20 transfer
+        //
+        // This precompile branch is expected to be called from the ERC20 burn function\
+        //
+        // Input slice format:
+        //      sender (20 bytes) - Eth address of the address that burned his erc20 tokens
+        //      amount (U256 le bytes) - the amount that was burned
+        //      recipient_account_id (bytes) - the NEAR recipient account which will receive NEP-141 tokens
+
+        //TODO: add method in Aurora connector and call promise `get_near_account_for_evm_token(context.caller)`
+        let nep141address = context.caller.to_string();
+
+        let mut input = input;
+
+        let mut sender = [0u8; 20];
+        sender.copy_from_slice(&input[..20]);
+        input = &input[20..];
+
+        let amount = U256::from_little_endian(&input[..32]).as_u128();
+        input = &input[32..];
+
+        let receiver_account_id: AccountId = String::from_utf8(input.to_vec()).unwrap();
+
+        (
+            nep141address,
+            NEP41TransferCallArgs {
+                receiver_id: receiver_account_id,
+                amount,
+                memo: None,
+            },
+        )
+    };
+
+    let promise0 = sdk::promise_create(
+        nep141account,
+        b"ft_transfer",
+        BorshSerialize::try_to_vec(&args).ok().unwrap().as_slice(),
+        0,
+        GAS_FOR_FT_TRANSFER,
+    );
+
+    sdk::promise_return(promise0);
+}
+
+#[allow(dead_code)]
+fn exit_to_ethereum(input: &[u8], context: &Context) {
+    // TODO: Determine the correct amount of gas
+    const GAS_FOR_WITHDRAW: Gas = 50_000;
+    // if Self::required_gas(input)? > target_gas {
+    //     return Err(ExitError::OutOfGas);
+    // }
+
+    let (nep141account, serialized_args) = if context.apparent_value != U256::from(0) {
+        // ETH transfer
+        //
+        // Input slice format:
+        //      eth_recipient (20 bytes) - the address of recipient which will receive ETH on Ethereum
+
+        let eth_recipient: AccountId = String::from_utf8(input.to_vec()).unwrap();
+        let args = BridgedTokenWithdrawEthConnectorArgs {
+            amount: context.apparent_value.as_u128(),
+            recipient: eth_recipient,
+        };
+
+        (
+            String::from_utf8(sdk::current_account_id()).unwrap(),
+            BorshSerialize::try_to_vec(&args).ok().unwrap(),
+        )
+    } else {
+        // ERC-20 transfer
+        //
+        // This precompile branch is expected to be called from the ERC20 withdraw function
+        // (or burn function with some flag provided that this is expected to be withdrawn)
+        //
+        // Input slice format:
+        //      sender (20 bytes) - Eth address of the address that burned his erc20 tokens
+        //      amount (U256 le bytes) - the amount that was burned
+        //      eth_recipient (20 bytes) - the address of recipient which will receive ETH on Ethereum
+
+        //TODO: add method in Aurora connector and call promise `get_near_account_for_evm_token(context.caller)`
+        let nep141address = context.caller.to_string();
+
+        let mut input = input;
+
+        let mut sender = [0u8; 20];
+        sender.copy_from_slice(&input[..20]);
+        input = &input[20..];
+
+        let amount = U256::from_little_endian(&input[..32]).as_u128();
+        input = &input[32..];
+
+        let eth_recipient: AccountId = String::from_utf8(input.to_vec()).unwrap();
+        let args = BridgedTokenWithdrawArgs {
+            recipient: eth_recipient,
+            amount,
+        };
+
+        (
+            nep141address,
+            BorshSerialize::try_to_vec(&args).ok().unwrap(),
+        )
+    };
+
+    let promise0 = sdk::promise_create(
+        nep141account,
+        b"withdraw",
+        serialized_args.as_slice(),
+        0,
+        GAS_FOR_WITHDRAW,
+    );
+
+    sdk::promise_return(promise0);
 }
 
 #[allow(dead_code)]
@@ -104,7 +263,6 @@ fn sha256(input: &[u8]) -> H256 {
 }
 #[cfg(feature = "contract")]
 fn sha256(input: &[u8]) -> H256 {
-    use crate::sdk;
     sdk::sha256(input)
 }
 
@@ -161,6 +319,7 @@ fn blake2f(_rounds: u32, _h: [U256; 2], _m: [U256; 4], _t: [u64; 2], _f: bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::near_account_to_evm_address;
 
     #[test]
     fn test_ecverify() {
@@ -198,5 +357,17 @@ mod tests {
     #[test]
     fn test_identity() {
         assert_eq!(identity(b""), b"")
+    }
+
+    #[test]
+    fn test_precompile_id() {
+        assert_eq!(
+            EXIT_TO_ETHEREUM_ID,
+            near_account_to_evm_address("exitToEthereum".as_bytes()).to_low_u64_be()
+        );
+        assert_eq!(
+            EXIT_TO_NEAR_ID,
+            near_account_to_evm_address("exitToNear".as_bytes()).to_low_u64_be()
+        );
     }
 }
